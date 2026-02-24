@@ -8,13 +8,15 @@ The system generates a dataset of realistic support chat dialogs, then analyzes 
 
 ```
 ├── generate.py        # Generates 100 chat dialogs with ground truth labels
-├── analyze.py         # Analyzes dialogs using GPT-4.1
-├── analysis.ipynb     # Jupyter notebook with step-by-step analysis
+├── analyze.py         # Analyzes dialogs using GPT-4.1 (few-shot + CoT)
+├── evaluate.py        # Computes accuracy metrics (intent, satisfaction, quality, mistakes)
+├── analysis.ipynb     # Jupyter notebook with visualizations
 ├── requirements.txt   # Python dependencies
 ├── data/
 │   ├── dataset.json   # Generated dialogs (after running generate.py)
-│   └── analysis.json  # LLM analysis results (after running analyze.py)
-└── .env               # API key (create from .env.example)
+│   ├── analysis.json  # LLM analysis results (after running analyze.py)
+│   └── evaluation.json # Evaluation metrics (after running evaluate.py)
+└── .env               # API credentials (create from .env.example)
 ```
 
 ## Setup
@@ -45,13 +47,15 @@ Generates 100 support chat dialogs with ground truth labels covering:
 - **Scenarios**: successful, problematic, conflict, agent_error, hidden_dissatisfaction
 - **Output**: `data/dataset.json`
 
+Uses parallel execution (5 workers) with automatic retry on API failures.
+
 ### Step 2: Analyze Dialogs
 
 ```bash
 python analyze.py
 ```
 
-Sends each dialog to GPT-4.1 for analysis. For each dialog determines:
+Sends each dialog to GPT-4.1 for analysis using few-shot examples and chain-of-thought reasoning. For each dialog determines:
 - `intent` — customer's reason for contacting support
 - `satisfaction` — real satisfaction level (satisfied / neutral / unsatisfied)
 - `quality_score` — agent performance rating (1-5)
@@ -59,7 +63,22 @@ Sends each dialog to GPT-4.1 for analysis. For each dialog determines:
 
 Output: `data/analysis.json`
 
-### Step 3: Explore Results in Notebook
+### Step 3: Evaluate Results
+
+```bash
+python evaluate.py
+```
+
+Computes and prints accuracy metrics:
+- Intent classification accuracy
+- Satisfaction prediction accuracy
+- Quality score MAE, correlation, exact match
+- Hidden dissatisfaction detection rate
+- Per-mistake precision, recall, F1
+
+Output: `data/evaluation.json`
+
+### Step 4: Explore Results in Notebook
 
 ```bash
 jupyter notebook analysis.ipynb
@@ -77,12 +96,16 @@ The notebook provides:
 ## Key Features
 
 - **Deterministic results**: Uses `temperature=0` and `seed` parameter for reproducibility
+- **Few-shot + Chain-of-Thought**: Analysis prompt includes reference examples and step-by-step reasoning
 - **Hidden dissatisfaction detection**: ~15% of dialogs contain customers who appear polite but are actually unsatisfied
 - **Ground truth labels**: Each generated dialog includes expert-level annotations for validation
 - **Comprehensive error taxonomy**: 5 types of agent mistakes tracked and evaluated
+- **Parallel execution**: Both generation and analysis use thread pool for faster processing
+- **Automatic retry**: Exponential backoff on API failures (3 attempts)
 
 ## Tech Stack
 
 - Python 3.12
 - Azure OpenAI GPT-4.1
 - pandas, matplotlib, seaborn, scikit-learn
+- tenacity (retry logic)

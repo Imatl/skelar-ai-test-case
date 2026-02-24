@@ -1,10 +1,12 @@
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from dotenv import load_dotenv
 from openai import AzureOpenAI
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 load_dotenv()
 
@@ -15,7 +17,7 @@ client = AzureOpenAI(
 )
 
 MODEL = os.getenv("AZURE_OPENAI_DEPLOYMENT")
-SEED = 42
+MAX_WORKERS = 5
 DATA_DIR = Path(__file__).parent / "data"
 OUTPUT_FILE = DATA_DIR / "dataset.json"
 
@@ -29,235 +31,67 @@ AGENT_MISTAKES = [
     "unnecessary_escalation",
 ]
 
-SCENARIOS = []
+SCENARIO_TEMPLATES = [
+    {"case_type": "successful",             "satisfaction": "satisfied",   "quality_score": 5, "agent_mistakes": [],                                                      "hidden_dissatisfaction": False},
+    {"case_type": "successful",             "satisfaction": "satisfied",   "quality_score": 4, "agent_mistakes": [],                                                      "hidden_dissatisfaction": False},
+    {"case_type": "successful",             "satisfaction": "neutral",     "quality_score": 3, "agent_mistakes": [],                                                      "hidden_dissatisfaction": False},
+    {"case_type": "successful",             "satisfaction": "satisfied",   "quality_score": 4, "agent_mistakes": [],                                                      "hidden_dissatisfaction": False},
+    {"case_type": "problematic",            "satisfaction": "neutral",     "quality_score": 3, "agent_mistakes": ["ignored_question"],                                    "hidden_dissatisfaction": False},
+    {"case_type": "problematic",            "satisfaction": "unsatisfied", "quality_score": 2, "agent_mistakes": ["no_resolution"],                                       "hidden_dissatisfaction": False},
+    {"case_type": "problematic",            "satisfaction": "neutral",     "quality_score": 3, "agent_mistakes": ["incorrect_info"],                                      "hidden_dissatisfaction": False},
+    {"case_type": "conflict",               "satisfaction": "unsatisfied", "quality_score": 2, "agent_mistakes": ["rude_tone", "no_resolution"],                          "hidden_dissatisfaction": False},
+    {"case_type": "conflict",               "satisfaction": "unsatisfied", "quality_score": 1, "agent_mistakes": ["ignored_question", "rude_tone"],                       "hidden_dissatisfaction": False},
+    {"case_type": "conflict",               "satisfaction": "unsatisfied", "quality_score": 2, "agent_mistakes": ["unnecessary_escalation"],                              "hidden_dissatisfaction": False},
+    {"case_type": "conflict",               "satisfaction": "unsatisfied", "quality_score": 1, "agent_mistakes": ["incorrect_info", "no_resolution"],                     "hidden_dissatisfaction": False},
+    {"case_type": "agent_error",            "satisfaction": "unsatisfied", "quality_score": 1, "agent_mistakes": ["incorrect_info", "ignored_question", "no_resolution"], "hidden_dissatisfaction": False},
+    {"case_type": "agent_error",            "satisfaction": "unsatisfied", "quality_score": 2, "agent_mistakes": ["rude_tone", "incorrect_info"],                         "hidden_dissatisfaction": False},
+    {"case_type": "agent_error",            "satisfaction": "unsatisfied", "quality_score": 1, "agent_mistakes": ["no_resolution", "unnecessary_escalation"],             "hidden_dissatisfaction": False},
+    {"case_type": "hidden_dissatisfaction", "satisfaction": "unsatisfied", "quality_score": 2, "agent_mistakes": ["no_resolution"],                                       "hidden_dissatisfaction": True},
+    {"case_type": "hidden_dissatisfaction", "satisfaction": "unsatisfied", "quality_score": 3, "agent_mistakes": ["ignored_question"],                                    "hidden_dissatisfaction": True},
+    {"case_type": "hidden_dissatisfaction", "satisfaction": "unsatisfied", "quality_score": 2, "agent_mistakes": ["incorrect_info"],                                      "hidden_dissatisfaction": True},
+    {"case_type": "successful",             "satisfaction": "satisfied",   "quality_score": 5, "agent_mistakes": [],                                                      "hidden_dissatisfaction": False},
+    {"case_type": "problematic",            "satisfaction": "neutral",     "quality_score": 3, "agent_mistakes": ["unnecessary_escalation"],                              "hidden_dissatisfaction": False},
+    {"case_type": "problematic",            "satisfaction": "unsatisfied", "quality_score": 2, "agent_mistakes": ["ignored_question", "no_resolution"],                   "hidden_dissatisfaction": False},
+]
+
+INTENT_DESCRIPTIONS = {
+    "payment_issue": "The customer has a problem with a specific payment transaction (charge failed, double charge, wrong amount, payment stuck/pending, card declined during checkout).",
+    "technical_error": "The customer experiences a SOFTWARE BUG or PLATFORM MALFUNCTION — NOT a payment failure. Examples: app crashes, pages not loading, buttons not working, dashboard showing wrong data, features broken, notifications not received, PDF export failing, search not working. The issue must be clearly a software/platform bug, NOT related to a payment transaction.",
+    "account_access": "The customer cannot log in, forgot password, account locked, 2FA issues, email verification problems, session expiring unexpectedly.",
+    "pricing_plan": "The customer has questions about subscription plans, pricing tiers, feature comparisons, upgrade/downgrade options, billing cycle changes.",
+    "refund": "The customer wants their money back for a completed transaction — refund request, refund status check, partial refund, refund policy questions.",
+}
+
+CASE_DESCRIPTIONS = {
+    "successful": "The agent successfully resolves the customer's issue. The interaction is smooth and professional.",
+    "problematic": "The agent struggles with the issue. There are communication problems or partial resolution.",
+    "conflict": "The interaction becomes tense or confrontational. The customer is clearly frustrated.",
+    "agent_error": "The agent makes significant errors during the interaction.",
+    "hidden_dissatisfaction": "The customer appears polite but their issue is not actually resolved.",
+}
 
 
 def build_scenario_matrix():
     configs = []
     id_counter = 1
-
     for intent in INTENTS:
-        configs.append({
-            "id": id_counter,
-            "intent": intent,
-            "case_type": "successful",
-            "satisfaction": "satisfied",
-            "quality_score": 5,
-            "agent_mistakes": [],
-            "hidden_dissatisfaction": False,
-        })
-        id_counter += 1
-
-        configs.append({
-            "id": id_counter,
-            "intent": intent,
-            "case_type": "successful",
-            "satisfaction": "satisfied",
-            "quality_score": 4,
-            "agent_mistakes": [],
-            "hidden_dissatisfaction": False,
-        })
-        id_counter += 1
-
-        configs.append({
-            "id": id_counter,
-            "intent": intent,
-            "case_type": "successful",
-            "satisfaction": "neutral",
-            "quality_score": 3,
-            "agent_mistakes": [],
-            "hidden_dissatisfaction": False,
-        })
-        id_counter += 1
-
-        configs.append({
-            "id": id_counter,
-            "intent": intent,
-            "case_type": "successful",
-            "satisfaction": "satisfied",
-            "quality_score": 4,
-            "agent_mistakes": [],
-            "hidden_dissatisfaction": False,
-        })
-        id_counter += 1
-
-        configs.append({
-            "id": id_counter,
-            "intent": intent,
-            "case_type": "problematic",
-            "satisfaction": "neutral",
-            "quality_score": 3,
-            "agent_mistakes": ["ignored_question"],
-            "hidden_dissatisfaction": False,
-        })
-        id_counter += 1
-
-        configs.append({
-            "id": id_counter,
-            "intent": intent,
-            "case_type": "problematic",
-            "satisfaction": "unsatisfied",
-            "quality_score": 2,
-            "agent_mistakes": ["no_resolution"],
-            "hidden_dissatisfaction": False,
-        })
-        id_counter += 1
-
-        configs.append({
-            "id": id_counter,
-            "intent": intent,
-            "case_type": "problematic",
-            "satisfaction": "neutral",
-            "quality_score": 3,
-            "agent_mistakes": ["incorrect_info"],
-            "hidden_dissatisfaction": False,
-        })
-        id_counter += 1
-
-        configs.append({
-            "id": id_counter,
-            "intent": intent,
-            "case_type": "conflict",
-            "satisfaction": "unsatisfied",
-            "quality_score": 2,
-            "agent_mistakes": ["rude_tone", "no_resolution"],
-            "hidden_dissatisfaction": False,
-        })
-        id_counter += 1
-
-        configs.append({
-            "id": id_counter,
-            "intent": intent,
-            "case_type": "conflict",
-            "satisfaction": "unsatisfied",
-            "quality_score": 1,
-            "agent_mistakes": ["ignored_question", "rude_tone"],
-            "hidden_dissatisfaction": False,
-        })
-        id_counter += 1
-
-        configs.append({
-            "id": id_counter,
-            "intent": intent,
-            "case_type": "conflict",
-            "satisfaction": "unsatisfied",
-            "quality_score": 2,
-            "agent_mistakes": ["unnecessary_escalation"],
-            "hidden_dissatisfaction": False,
-        })
-        id_counter += 1
-
-        configs.append({
-            "id": id_counter,
-            "intent": intent,
-            "case_type": "conflict",
-            "satisfaction": "unsatisfied",
-            "quality_score": 1,
-            "agent_mistakes": ["incorrect_info", "no_resolution"],
-            "hidden_dissatisfaction": False,
-        })
-        id_counter += 1
-
-        configs.append({
-            "id": id_counter,
-            "intent": intent,
-            "case_type": "agent_error",
-            "satisfaction": "unsatisfied",
-            "quality_score": 1,
-            "agent_mistakes": ["incorrect_info", "ignored_question", "no_resolution"],
-            "hidden_dissatisfaction": False,
-        })
-        id_counter += 1
-
-        configs.append({
-            "id": id_counter,
-            "intent": intent,
-            "case_type": "agent_error",
-            "satisfaction": "unsatisfied",
-            "quality_score": 2,
-            "agent_mistakes": ["rude_tone", "incorrect_info"],
-            "hidden_dissatisfaction": False,
-        })
-        id_counter += 1
-
-        configs.append({
-            "id": id_counter,
-            "intent": intent,
-            "case_type": "agent_error",
-            "satisfaction": "unsatisfied",
-            "quality_score": 1,
-            "agent_mistakes": ["no_resolution", "unnecessary_escalation"],
-            "hidden_dissatisfaction": False,
-        })
-        id_counter += 1
-
-        configs.append({
-            "id": id_counter,
-            "intent": intent,
-            "case_type": "hidden_dissatisfaction",
-            "satisfaction": "unsatisfied",
-            "quality_score": 2,
-            "agent_mistakes": ["no_resolution"],
-            "hidden_dissatisfaction": True,
-        })
-        id_counter += 1
-
-        configs.append({
-            "id": id_counter,
-            "intent": intent,
-            "case_type": "hidden_dissatisfaction",
-            "satisfaction": "unsatisfied",
-            "quality_score": 3,
-            "agent_mistakes": ["ignored_question"],
-            "hidden_dissatisfaction": True,
-        })
-        id_counter += 1
-
-        configs.append({
-            "id": id_counter,
-            "intent": intent,
-            "case_type": "hidden_dissatisfaction",
-            "satisfaction": "unsatisfied",
-            "quality_score": 2,
-            "agent_mistakes": ["incorrect_info"],
-            "hidden_dissatisfaction": True,
-        })
-        id_counter += 1
-
-        configs.append({
-            "id": id_counter,
-            "intent": intent,
-            "case_type": "successful",
-            "satisfaction": "satisfied",
-            "quality_score": 5,
-            "agent_mistakes": [],
-            "hidden_dissatisfaction": False,
-        })
-        id_counter += 1
-
-        configs.append({
-            "id": id_counter,
-            "intent": intent,
-            "case_type": "problematic",
-            "satisfaction": "neutral",
-            "quality_score": 3,
-            "agent_mistakes": ["unnecessary_escalation"],
-            "hidden_dissatisfaction": False,
-        })
-        id_counter += 1
-
-        configs.append({
-            "id": id_counter,
-            "intent": intent,
-            "case_type": "problematic",
-            "satisfaction": "unsatisfied",
-            "quality_score": 2,
-            "agent_mistakes": ["ignored_question", "no_resolution"],
-            "hidden_dissatisfaction": False,
-        })
-        id_counter += 1
-
+        for tmpl in SCENARIO_TEMPLATES:
+            configs.append({"id": id_counter, "intent": intent, **tmpl})
+            id_counter += 1
     return configs
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=16))
+def call_llm(prompt):
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": "You are a dataset generator. Output only valid JSON, no extra text."},
+            {"role": "user", "content": prompt},
+        ],
+        response_format={"type": "json_object"},
+    )
+    return response.choices[0].message.content
 
 
 def generate_dialog(scenario):
@@ -273,28 +107,12 @@ def generate_dialog(scenario):
             "despite being unsatisfied. This should be subtle."
         )
 
-    case_descriptions = {
-        "successful": "The agent successfully resolves the customer's issue. The interaction is smooth and professional.",
-        "problematic": "The agent struggles with the issue. There are communication problems or partial resolution.",
-        "conflict": "The interaction becomes tense or confrontational. The customer is clearly frustrated.",
-        "agent_error": "The agent makes significant errors during the interaction.",
-        "hidden_dissatisfaction": "The customer appears polite but their issue is not actually resolved.",
-    }
-
-    intent_descriptions = {
-        "payment_issue": "The customer has a problem with a specific payment transaction (charge failed, double charge, wrong amount, payment stuck/pending, card declined during checkout).",
-        "technical_error": "The customer experiences a SOFTWARE BUG or PLATFORM MALFUNCTION — NOT a payment failure. Examples: app crashes, pages not loading, buttons not working, dashboard showing wrong data, features broken, notifications not received, PDF export failing, search not working. The issue must be clearly a software/platform bug, NOT related to a payment transaction.",
-        "account_access": "The customer cannot log in, forgot password, account locked, 2FA issues, email verification problems, session expiring unexpectedly.",
-        "pricing_plan": "The customer has questions about subscription plans, pricing tiers, feature comparisons, upgrade/downgrade options, billing cycle changes.",
-        "refund": "The customer wants their money back for a completed transaction — refund request, refund status check, partial refund, refund policy questions.",
-    }
-
     prompt = f"""Generate a realistic customer support chat dialog for an online payment/fintech platform.
 
 SCENARIO PARAMETERS:
 - Customer intent: {scenario["intent"]}
-- Intent definition: {intent_descriptions[scenario["intent"]]}
-- Case type: {scenario["case_type"]} — {case_descriptions[scenario["case_type"]]}
+- Intent definition: {INTENT_DESCRIPTIONS[scenario["intent"]]}
+- Case type: {scenario["case_type"]} — {CASE_DESCRIPTIONS[scenario["case_type"]]}
 - Target satisfaction: {scenario["satisfaction"]}
 - Agent quality score: {scenario["quality_score"]}/5
 - Agent mistakes to include: {mistakes_str}
@@ -325,18 +143,7 @@ Return ONLY a valid JSON object with this exact structure:
   ]
 }}"""
 
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": "You are a dataset generator. Output only valid JSON, no extra text."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0,
-        seed=SEED + scenario["id"],
-        response_format={"type": "json_object"},
-    )
-
-    content = response.choices[0].message.content
+    content = call_llm(prompt)
     dialog_data = json.loads(content)
 
     return {
@@ -362,20 +169,27 @@ def main():
     print(f"Total scenarios: {len(scenarios)}")
 
     dataset = []
-    for i, scenario in enumerate(scenarios):
-        print(f"Generating dialog {i + 1}/{len(scenarios)} (id={scenario['id']}, "
-              f"intent={scenario['intent']}, type={scenario['case_type']})...")
-        try:
-            dialog = generate_dialog(scenario)
-            dataset.append(dialog)
-        except Exception as e:
-            print(f"  ERROR generating dialog {scenario['id']}: {e}")
-            continue
+    errors = 0
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(generate_dialog, s): s for s in scenarios}
+        for future in as_completed(futures):
+            scenario = futures[future]
+            try:
+                dialog = future.result()
+                dataset.append(dialog)
+                print(f"  Generated dialog id={dialog['id']} "
+                      f"(intent={scenario['intent']}, type={scenario['case_type']})")
+            except Exception as e:
+                errors += 1
+                print(f"  ERROR generating dialog {scenario['id']}: {e}")
+
+    dataset.sort(key=lambda d: d["id"])
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(dataset, f, indent=2, ensure_ascii=False)
 
-    print(f"\nGenerated {len(dataset)} dialogs -> {OUTPUT_FILE}")
+    print(f"\nGenerated {len(dataset)} dialogs ({errors} errors) -> {OUTPUT_FILE}")
 
     intent_counts = {}
     case_counts = {}
