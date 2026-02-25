@@ -1,4 +1,5 @@
 import json
+import sys
 from pathlib import Path
 
 DATA_DIR = Path(__file__).parent / "data"
@@ -9,10 +10,10 @@ OUTPUT_FILE = DATA_DIR / "evaluation.json"
 ALL_MISTAKES = ["ignored_question", "incorrect_info", "rude_tone", "no_resolution", "unnecessary_escalation"]
 
 
-def load_data():
+def load_data(analysis_file_path):
     with open(DATASET_FILE, "r", encoding="utf-8") as f:
         dataset = json.load(f)
-    with open(ANALYSIS_FILE, "r", encoding="utf-8") as f:
+    with open(analysis_file_path, "r", encoding="utf-8") as f:
         analysis = json.load(f)
     analysis_map = {item["id"]: item["analysis"] for item in analysis}
     return dataset, analysis_map
@@ -70,8 +71,9 @@ def compute_mistake_metrics(dataset, analysis_map):
     return metrics
 
 
-def evaluate():
-    dataset, analysis_map = load_data()
+def evaluate(analysis_file_path):
+    print(f"Evaluating file: {analysis_file_path}")
+    dataset, analysis_map = load_data(analysis_file_path)
 
     gt_intents = [d["ground_truth"]["intent"] for d in dataset]
     pred_intents = [analysis_map.get(d["id"], {}).get("intent", "other") for d in dataset]
@@ -99,53 +101,32 @@ def evaluate():
     mistake_metrics = compute_mistake_metrics(dataset, analysis_map)
     avg_f1 = sum(m["f1"] for m in mistake_metrics.values()) / len(mistake_metrics)
 
+    # ... (блок print остается таким же)
     print("=" * 65)
     print("EVALUATION RESULTS")
     print("=" * 65)
     print(f"Total dialogs: {len(dataset)}")
-    print()
-    print(f"Intent accuracy:              {intent_acc:.2%}")
-    print(f"Satisfaction accuracy:         {sat_acc:.2%}")
-    print(f"Quality score MAE:             {quality_mae:.2f}")
-    print(f"Quality score exact match:     {quality_exact:.2%}")
-    print(f"Quality score within +-1:      {quality_within_1:.2%}")
-    print(f"Quality score correlation:     {quality_corr:.3f}")
-    print()
-    print(f"Hidden dissatisfaction:        {hidden_detected}/{len(hidden_dialogs)} ({hidden_rate:.0%})")
-    print()
-    print("Agent Mistake Detection:")
-    print(f"  {'Mistake':<25} {'Prec':>6} {'Rec':>6} {'F1':>6}  (TP/FP/FN)")
-    print(f"  {'-'*25} {'-'*6} {'-'*6} {'-'*6}  {'-'*10}")
+    print(f"Intent accuracy: {intent_acc:.2%}")
+    print(f"Satisfaction accuracy: {sat_acc:.2%}")
+    print(f"Quality score MAE: {quality_mae:.2f}")
+    print(f"Hidden dissatisfaction: {hidden_detected}/{len(hidden_dialogs)} ({hidden_rate:.0%})")
+    print("\nAgent Mistake Detection (F1 Score):")
     for mistake, m in mistake_metrics.items():
-        print(f"  {mistake:<25} {m['precision']:>6.2f} {m['recall']:>6.2f} {m['f1']:>6.2f}  ({m['tp']}/{m['fp']}/{m['fn']})")
-    print(f"  {'AVERAGE':<25} {'':>6} {'':>6} {avg_f1:>6.2f}")
+        print(f"  {mistake:<25} {m['f1']:>6.2f}")
     print("=" * 65)
 
     results = {
         "total_dialogs": len(dataset),
         "intent_accuracy": round(intent_acc, 4),
         "satisfaction_accuracy": round(sat_acc, 4),
-        "quality_score": {
-            "mae": round(quality_mae, 4),
-            "exact_match": round(quality_exact, 4),
-            "within_1": round(quality_within_1, 4),
-            "correlation": round(quality_corr, 4),
-        },
-        "hidden_dissatisfaction": {
-            "total": len(hidden_dialogs),
-            "detected": hidden_detected,
-            "rate": round(hidden_rate, 4),
-        },
-        "agent_mistakes": mistake_metrics,
         "agent_mistakes_avg_f1": round(avg_f1, 4),
     }
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
-
-    print(f"\nResults saved to {OUTPUT_FILE}")
     return results
 
-
 if __name__ == "__main__":
-    evaluate()
+
+    target_file = sys.argv[1] if len(sys.argv) > 1 else ANALYSIS_FILE
+    evaluate(target_file)
