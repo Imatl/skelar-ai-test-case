@@ -18,7 +18,7 @@ client = AzureOpenAI(
 
 MODEL = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 MAX_WORKERS = 5
-DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR = Path(__file__).parent.parent / "data"
 OUTPUT_FILE = DATA_DIR / "dataset.json"
 
 INTENTS = ["payment_issue", "technical_error", "account_access", "pricing_plan", "refund"]
@@ -171,18 +171,29 @@ def main():
     dataset = []
     errors = 0
 
+    cancelled = False
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(generate_dialog, s): s for s in scenarios}
-        for future in as_completed(futures):
-            scenario = futures[future]
-            try:
-                dialog = future.result()
-                dataset.append(dialog)
-                print(f"  Generated dialog id={dialog['id']} "
-                      f"(intent={scenario['intent']}, type={scenario['case_type']})")
-            except Exception as e:
-                errors += 1
-                print(f"  ERROR generating dialog {scenario['id']}: {e}")
+        try:
+            for future in as_completed(futures):
+                scenario = futures[future]
+                try:
+                    dialog = future.result()
+                    dataset.append(dialog)
+                    print(f"  Generated dialog id={dialog['id']} "
+                          f"(intent={scenario['intent']}, type={scenario['case_type']})")
+                except Exception as e:
+                    errors += 1
+                    print(f"  ERROR generating dialog {scenario['id']}: {e}")
+        except KeyboardInterrupt:
+            cancelled = True
+            print(f"\n  Interrupted. Cancelling pending tasks...")
+            for f in futures:
+                f.cancel()
+
+    if cancelled:
+        print(f"  Saved {len(dataset)} completed dialogs before interruption.")
+        raise KeyboardInterrupt
 
     dataset.sort(key=lambda d: d["id"])
 

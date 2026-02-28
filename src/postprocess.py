@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR = Path(__file__).parent.parent / "data"
 INPUT_FILE = DATA_DIR / "analysis_verified.json"
 DATASET_FILE = DATA_DIR / "dataset.json"
 OUTPUT_FILE = DATA_DIR / "analysis_final.json"

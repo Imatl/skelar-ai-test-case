@@ -1,6 +1,8 @@
 import json
 import os
 import re
+import statistics
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -18,7 +20,8 @@ client = AzureOpenAI(
 
 MODEL = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 MAX_WORKERS = 5
-DATA_DIR = Path(__file__).parent / "data"
+VOTING_ROUNDS = 3
+DATA_DIR = Path(__file__).parent.parent / "data"
 INPUT_FILE = DATA_DIR / "dataset.json"
 OUTPUT_FILE = DATA_DIR / "analysis.json"
 
@@ -86,6 +89,39 @@ Customer: No, I think that covers it. I'll call my bank. Thanks.
 REASONING: The customer's issue is a pending payment. The agent investigated, took action (sent release request), and provided a concrete next step (call bank with reference number). The customer said "Thanks" and has a clear path forward. Even though the payment isn't instantly resolved, the agent did everything within their power. This is NOT no_resolution — the agent provided a working solution and actionable steps. This is NOT ignored_question — all questions were addressed. Satisfaction is satisfied because the customer has a clear resolution path and expressed thanks genuinely.
 ANSWER:
 {"intent": "payment_issue", "satisfaction": "satisfied", "quality_score": 4, "agent_mistakes": []}
+
+=== EXAMPLE 6: NO_RESOLUTION vs RESOLVED — critical calibration ===
+Customer: I can't download my invoice for order #4420. The button does nothing.
+Agent: I'm sorry about that. I've generated the invoice manually and sent it to your email at j.smith@mail.com. Can you check if you received it?
+Customer: Yes, got it. But can you also fix the download button?
+Agent: I've reported the bug to our engineering team. It should be fixed in the next update. For now, you can always request invoices through support.
+Customer: Alright, fair enough. Thanks.
+
+REASONING: The customer's PRIMARY problem was getting the invoice — and the agent SOLVED it by emailing it. The secondary request (fix the button) was acknowledged and reported. The customer said "fair enough, thanks" — genuine acceptance. This IS a resolution. The agent provided a concrete workaround AND escalated the bug appropriately. No mistakes here.
+ANSWER:
+{"intent": "technical_error", "satisfaction": "satisfied", "quality_score": 4, "agent_mistakes": []}
+
+=== EXAMPLE 7: ACTUAL NO_RESOLUTION ===
+Customer: I've been charged $150 but my order was cancelled. Can I get a refund?
+Agent: I can see the order was cancelled. For refund requests, you'll need to contact our billing department.
+Customer: Can you transfer me or give me their contact info?
+Agent: They can be reached during business hours. Is there anything else I can help you with?
+Customer: You haven't helped me with anything yet...
+
+REASONING: The customer asked for a refund. The agent redirected to billing without providing contact info, a transfer, or any actionable step. The customer's follow-up question about contact info was partially ignored (no specific contact given). The issue is completely unresolved — the customer is no closer to a refund. This IS no_resolution and unnecessary_escalation (redirected when they could have processed or at least transferred).
+ANSWER:
+{"intent": "refund", "satisfaction": "unsatisfied", "quality_score": 1, "agent_mistakes": ["no_resolution", "unnecessary_escalation", "ignored_question"]}
+
+=== EXAMPLE 8: UNNECESSARY ESCALATION ===
+Customer: I want to switch from the Pro plan ($79/mo) to the Basic plan ($29/mo).
+Agent: I understand you'd like to downgrade. Let me transfer you to our billing specialist who handles plan changes.
+Customer: Can't you just do it from your end?
+Agent: Plan changes need to be processed by our billing team to ensure everything is correct. Please hold while I transfer you.
+Customer: Fine...
+
+REASONING: The customer asked for a simple plan downgrade — a routine operation most support agents can handle directly. The agent escalated to a "billing specialist" instead of making the change themselves. The customer even questioned this ("Can't you just do it?") and the agent insisted on transferring. This IS unnecessary_escalation. The issue also remains unresolved at the end of this conversation (no_resolution) since the agent didn't make the change. Satisfaction is unsatisfied — the customer is clearly annoyed ("Fine...").
+ANSWER:
+{"intent": "pricing_plan", "satisfaction": "unsatisfied", "quality_score": 2, "agent_mistakes": ["unnecessary_escalation", "no_resolution"]}
 """
 
 ANALYSIS_PROMPT = """You are an expert customer support quality analyst.
@@ -138,9 +174,13 @@ HIDDEN DISSATISFACTION CHECK — ask yourself these 3 questions:
 
 - rude_tone: Agent used dismissive, condescending, sarcastic, or hostile language. Being brief, formal, or using templates is NOT rude. The agent must have shown clear disrespect.
 
-- no_resolution: The customer's PRIMARY problem remains UNSOLVED at the end of the conversation. NOT applicable if: the agent provided a working solution, gave actionable next steps the customer accepted, or the fix just needs time to process. If the agent said "do X" and the customer agreed — that IS resolution.
+- no_resolution: The customer's PRIMARY problem remains UNSOLVED at the end of the conversation.
+  IS no_resolution: agent said "contact another department" without transferring or giving details; agent gave only generic advice that doesn't address the specific issue; customer's original request was never fulfilled or started.
+  NOT no_resolution: agent provided a workaround that solves the immediate need; agent gave specific actionable steps the customer accepted; agent initiated a fix that just needs time to process (refund in 3-5 days, bug fix deployed, etc.); agent resolved the main issue even if a secondary request remains open.
 
-- unnecessary_escalation: Agent transferred to another team/manager when they clearly had the information and ability to resolve it themselves. Simply saying "let me check with the team" is NOT escalation.
+- unnecessary_escalation: Agent transferred/redirected to another team/manager when they clearly had the information and ability to resolve it themselves.
+  IS unnecessary_escalation: agent transfers for routine operations (password reset, plan change, simple refund); agent says "contact billing/another department" for something they could handle.
+  NOT unnecessary_escalation: agent escalates a genuine technical bug to engineering; agent transfers to a specialist for a complex compliance/legal issue; simply saying "let me check with the team" is NOT escalation.
 
 RESPOND IN THIS EXACT FORMAT:
 REASONING: <2-3 sentences analyzing the dialog>
@@ -182,12 +222,19 @@ def extract_json_from_response(content):
     return json.loads(content)
 
 
+SYSTEM_PROMPTS = [
+    "You are a senior customer support quality analyst with 10 years of experience. You evaluate support interactions with precision. You are especially good at detecting hidden dissatisfaction — when customers use polite words but their problem remains unsolved.",
+    "You are an expert customer experience evaluator. You focus on whether the customer's actual problem was solved, not just whether the conversation ended politely. You carefully distinguish between genuine resolution and surface-level politeness.",
+    "You are a strict quality auditor for customer support teams. You evaluate each interaction by checking: was the core issue resolved? Did the agent make mistakes? Is the customer truly satisfied or just being polite? You base judgments only on evidence in the dialog.",
+]
+
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=16))
-def call_llm(prompt):
+def call_llm(prompt, system_prompt):
     response = client.chat.completions.create(
         model=MODEL,
         messages=[
-            {"role": "system", "content": "You are a senior customer support quality analyst with 10 years of experience. You evaluate support interactions with precision. You are especially good at detecting hidden dissatisfaction — when customers use polite words but their problem remains unsolved."},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ],
     )
@@ -205,6 +252,31 @@ def validate_analysis(analysis):
     return analysis
 
 
+def aggregate_votes(analyses):
+    intents = [a["intent"] for a in analyses]
+    intent = Counter(intents).most_common(1)[0][0]
+
+    satisfactions = [a["satisfaction"] for a in analyses]
+    satisfaction = Counter(satisfactions).most_common(1)[0][0]
+
+    scores = [a["quality_score"] for a in analyses]
+    quality_score = int(statistics.median(scores))
+
+    mistake_counts = Counter()
+    for a in analyses:
+        for m in a["agent_mistakes"]:
+            mistake_counts[m] += 1
+    threshold = len(analyses) / 2
+    agent_mistakes = [m for m, count in mistake_counts.items() if count > threshold]
+
+    return {
+        "intent": intent,
+        "satisfaction": satisfaction,
+        "quality_score": quality_score,
+        "agent_mistakes": agent_mistakes,
+    }
+
+
 def analyze_dialog(dialog):
     dialog_text = format_dialog(dialog["messages"])
     prompt = ANALYSIS_PROMPT.format(
@@ -212,12 +284,21 @@ def analyze_dialog(dialog):
         dialog_text=dialog_text,
     )
 
-    content = call_llm(prompt)
-    analysis = extract_json_from_response(content)
-    return validate_analysis(analysis)
+    analyses = []
+    for i in range(VOTING_ROUNDS):
+        system_prompt = SYSTEM_PROMPTS[i % len(SYSTEM_PROMPTS)]
+        content = call_llm(prompt, system_prompt)
+        analysis = extract_json_from_response(content)
+        analyses.append(validate_analysis(analysis))
+
+    return aggregate_votes(analyses)
 
 
-def main():
+def main(voting_rounds=None):
+    global VOTING_ROUNDS
+    if voting_rounds is not None:
+        VOTING_ROUNDS = voting_rounds
+
     if not INPUT_FILE.exists():
         print(f"Error: {INPUT_FILE} not found. Run generate.py first.")
         return
@@ -226,34 +307,46 @@ def main():
         dataset = json.load(f)
 
     print(f"Loaded {len(dataset)} dialogs from {INPUT_FILE}")
+    print(f"Voting rounds: {VOTING_ROUNDS}")
 
     results = []
     errors = 0
 
+    cancelled = False
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(analyze_dialog, d): d for d in dataset}
-        for future in as_completed(futures):
-            dialog = futures[future]
-            try:
-                analysis = future.result()
-                results.append({
-                    "id": dialog["id"],
-                    "analysis": analysis,
-                })
-                print(f"  Analyzed dialog id={dialog['id']}")
-            except Exception as e:
-                errors += 1
-                print(f"  ERROR analyzing dialog {dialog['id']}: {e}")
-                results.append({
-                    "id": dialog["id"],
-                    "analysis": {
-                        "intent": "other",
-                        "satisfaction": "neutral",
-                        "quality_score": 3,
-                        "agent_mistakes": [],
-                        "error": str(e),
-                    },
-                })
+        try:
+            for future in as_completed(futures):
+                dialog = futures[future]
+                try:
+                    analysis = future.result()
+                    results.append({
+                        "id": dialog["id"],
+                        "analysis": analysis,
+                    })
+                    print(f"  Analyzed dialog id={dialog['id']}")
+                except Exception as e:
+                    errors += 1
+                    print(f"  ERROR analyzing dialog {dialog['id']}: {e}")
+                    results.append({
+                        "id": dialog["id"],
+                        "analysis": {
+                            "intent": "other",
+                            "satisfaction": "neutral",
+                            "quality_score": 3,
+                            "agent_mistakes": [],
+                            "error": str(e),
+                        },
+                    })
+        except KeyboardInterrupt:
+            cancelled = True
+            print(f"\n  Interrupted. Cancelling pending tasks...")
+            for f in futures:
+                f.cancel()
+
+    if cancelled:
+        print(f"  Saved {len(results)} completed dialogs before interruption.")
+        raise KeyboardInterrupt
 
     results.sort(key=lambda r: r["id"])
 

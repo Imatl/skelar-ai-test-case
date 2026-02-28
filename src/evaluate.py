@@ -2,7 +2,7 @@ import json
 import sys
 from pathlib import Path
 
-DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR = Path(__file__).parent.parent / "data"
 DATASET_FILE = DATA_DIR / "dataset.json"
 ANALYSIS_FILE = DATA_DIR / "analysis.json"
 OUTPUT_FILE = DATA_DIR / "evaluation.json"
